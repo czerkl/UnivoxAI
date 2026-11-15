@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -14,7 +15,7 @@ TG_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-current_model = "gemini-2.5-flash"  # Обновлено на актуальную стандартную быструю модель
+current_model = "gemini-2.5-flash"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,36 @@ SYSTEM_INSTRUCTION = (
 
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
+
+# --- [ КОНВЕРТЕР MARKDOWN -> TELEGRAM HTML ] ---
+def markdown_to_telegram_html(text: str) -> str:
+    """Конвертирует Markdown-разметку от Gemini в валидный Telegram HTML"""
+    if not text:
+        return ""
+
+    # 1. Обработка блоков кода (```код```), чтобы они не ломались внутри
+    def replace_code_block(match):
+        code_content = html.escape(match.group(1))
+        return f"<pre><code>{code_content}</code></pre>"
+    text = re.sub(r'```(?:[\w]*\n)?(.*?)```', replace_code_block, text, flags=re.DOTALL)
+
+    # 2. Обработка инлайн-кода (`код`)
+    def replace_inline_code(match):
+        return f"<code>{html.escape(match.group(1))}</code>"
+    text = re.sub(r'`([^`]+)`', replace_inline_code, text)
+
+    # 3. Жирный текст (**текст** или __текст__) -> <b>текст</b>
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
+
+    # 4. Курсив (*текст* или _текст_) -> <i>текст</i>
+    text = re.sub(r'(?<!\w)\*(.*?)\*(?!\w)', r'<i>\1</i>', text)
+    text = re.sub(r'(?<!\w)_(.*?)_(?!\w)', r'<i>\1</i>', text)
+
+    # 5. Заголовки (### Текст) -> преобразуем в жирный текст с новой строки
+    text = re.sub(r'^#{1,6}\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
+    return text
 
 # --- [ КОМАНДЫ ] ---
 
@@ -65,10 +96,10 @@ async def change_model(message: types.Message):
 async def get_info(message: types.Message):
     info_text = (
         f"📊 <b>Техническая сводка:</b>\n"
-        f"★ <b>Версия:</b> 6.3 Stable\n"
+        f"★ <b>Версия:</b> 6.4 Stable\n"
         f"★ <b>Библиотека:</b> Aiogram 3.17.0\n"
         f"★ <b>Платформа:</b> Render Cloud\n"
-        f"★ <b>Форматирование:</b> HTML Safe"
+        f"★ <b>Форматирование:</b> Auto-HTML Parser"
     )
     await message.answer(info_text, parse_mode=ParseMode.HTML)
 
@@ -87,19 +118,21 @@ async def chat_handler(message: types.Message):
             config={'system_instruction': SYSTEM_INSTRUCTION}
         )
         
-        answer = response.text if response.text else "⚠️ Извините, не удалось сформировать ответ."
+        raw_answer = response.text if response.text else "⚠️ Извините, не удалось сформировать ответ."
         duration = round(time.time() - start_time, 2)
         
-        # Красивая и безопасная подпись в HTML без ломающих символов
-        final_answer = f"{answer}\n\n⏱ <i>Ответ сформирован за {duration}с</i>"
+        # Превращаем Markdown от ИИ в чистый HTML для Telegram
+        formatted_answer = markdown_to_telegram_html(raw_answer)
+        
+        # Собираем итоговое сообщение
+        final_answer = f"{formatted_answer}\n\n⏱ <i>Ответ сформирован за {duration}с</i>"
 
         try:
-            # Отправляем строго через HTML, чтобы избежать багов с ### и точками
             await message.answer(final_answer, parse_mode=ParseMode.HTML)
         except Exception as html_err:
             logger.warning(f"HTML render error, falling back to plain text: {html_err}")
-            # Если ИИ выдал невалидный HTML, отправляем как чистый текст
-            await message.answer(final_answer)
+            # Если разметка всё же вызовет ошибку, отправляем как чистый текст без тегов
+            await message.answer(raw_answer)
             
     except Exception as e:
         error_msg = html.escape(str(e))
